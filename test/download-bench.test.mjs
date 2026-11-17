@@ -46,8 +46,16 @@ function makeOptions(url, overrides = {}) {
   };
 }
 
-function expectCode(code) {
-  return (error) => error instanceof BenchError && error.code === code;
+async function expectFailure(options, codes) {
+  const report = await runBenchmark(options);
+  assert.equal(report.ok, false, 'ожидался частичный отчёт с ok:false');
+  const expected = Array.isArray(codes) ? codes : [codes];
+  assert.ok(
+    expected.includes(report.error?.code),
+    `ожидался код ${expected.join('|')}, получен ${report.error?.code}: ${report.error?.message}`,
+  );
+  assert.equal(report.completedRequests, report.perRequest.length);
+  return report;
 }
 
 function writeTo(chunks) {
@@ -280,10 +288,54 @@ test('HTTP 4xx/5xx — ошибка HTTP_STATUS', async () => {
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1 })),
-      expectCode('HTTP_STATUS'),
+    const report = await expectFailure(
+      makeOptions(server.url, { requests: 1 }),
+      'HTTP_STATUS',
     );
+    assert.equal(report.completedRequests, 0);
+    assert.deepEqual(report.perRequest, []);
+    assert.equal(report.failedAt, 1);
+    assert.equal(report.totalBytes, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('ошибка на середине сохраняет замеры завершённых запросов', async () => {
+  const body = Buffer.alloc(512, 0x65);
+  let served = 0;
+  const server = await startServer((request, response) => {
+    served += 1;
+    if (served === 3) {
+      response.writeHead(503);
+      response.end('temporary');
+      return;
+    }
+    response.writeHead(200, { 'content-length': body.length });
+    response.end(body);
+  });
+
+  try {
+    const report = await runBenchmark(makeOptions(server.url, { requests: 5 }));
+
+    assert.equal(report.ok, false);
+    assert.equal(report.error.code, 'HTTP_STATUS');
+    assert.equal(report.failedAt, 3);
+    assert.equal(report.completedRequests, 2);
+    assert.equal(report.perRequest.length, 2);
+    assert.deepEqual(
+      report.perRequest.map((item) => item.index),
+      [1, 2],
+    );
+    assert.equal(report.totalBytes, body.length * 2);
+    assert.equal(report.status, 200);
+    assert.ok(Number.isFinite(report.avgRequestMs));
+    assert.ok(Number.isFinite(report.throughput.mibPerSecond));
+
+    const text = formatReport(report);
+    assert.match(text, /Частичный итог \(2 из 5\)/);
+    assert.match(text, /Ошибка \[HTTP_STATUS\] на запросе 3/);
+    assert.match(text, /В отчёт включены только успешно завершённые запросы/);
   } finally {
     await server.close();
   }
@@ -296,9 +348,9 @@ test('таймаут на запрос целиком', async () => {
 
   try {
     const started = performance.now();
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1, timeoutMs: 150 })),
-      expectCode('TIMEOUT'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1, timeoutMs: 150 }),
+      'TIMEOUT',
     );
     assert.ok(performance.now() - started < 3000);
   } finally {
@@ -314,9 +366,9 @@ test('Content-Length больше лимита — ошибка TOO_LARGE до �
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1, maxBytes: 1024 })),
-      expectCode('TOO_LARGE'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1, maxBytes: 1024 }),
+      'TOO_LARGE',
     );
   } finally {
     await server.close();
@@ -332,9 +384,9 @@ test('chunked-ответ больше лимита — ошибка TOO_LARGE', 
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1, maxBytes: 1024 })),
-      expectCode('TOO_LARGE'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1, maxBytes: 1024 }),
+      'TOO_LARGE',
     );
   } finally {
     await server.close();
@@ -350,11 +402,7 @@ test('оборванный ответ — ошибка', async () => {
   });
 
   try {
-    await assert.rejects(runBenchmark(makeOptions(server.url, { requests: 1 })), (error) => {
-      assert.ok(error instanceof BenchError);
-      assert.ok(['TRUNCATED', 'NETWORK'].includes(error.code), error.code);
-      return true;
-    });
+    await expectFailure(makeOptions(server.url, { requests: 1 }), ['TRUNCATED', 'NETWORK']);
   } finally {
     await server.close();
   }
@@ -401,9 +449,9 @@ test('лимит редиректов', async () => {
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(`${server.url}/r`, { requests: 1, maxRedirects: 2 })),
-      expectCode('REDIRECT_LIMIT'),
+    await expectFailure(
+      makeOptions(`${server.url}/r`, { requests: 1, maxRedirects: 2 }),
+      'REDIRECT_LIMIT',
     );
   } finally {
     await server.close();
@@ -417,10 +465,7 @@ test('цикл редиректов обнаруживается', async () => {
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(`${server.url}/a`, { requests: 1 })),
-      expectCode('REDIRECT_LOOP'),
-    );
+    await expectFailure(makeOptions(`${server.url}/a`, { requests: 1 }), 'REDIRECT_LOOP');
   } finally {
     await server.close();
   }
@@ -433,9 +478,9 @@ test('редирект без Location — ошибка', async () => {
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1 })),
-      expectCode('REDIRECT_NO_LOCATION'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1 }),
+      'REDIRECT_NO_LOCATION',
     );
   } finally {
     await server.close();
@@ -449,9 +494,9 @@ test('редирект на file:// запрещён', async () => {
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1 })),
-      expectCode('REDIRECT_PROTOCOL'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1 }),
+      'REDIRECT_PROTOCOL',
     );
   } finally {
     await server.close();
@@ -465,9 +510,9 @@ test('--max-redirects 0 запрещает даже один редирект', 
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1, maxRedirects: 0 })),
-      expectCode('REDIRECT_LIMIT'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1, maxRedirects: 0 }),
+      'REDIRECT_LIMIT',
     );
   } finally {
     await server.close();
@@ -511,9 +556,9 @@ test('таймаут срабатывает и при медленном тел�
 
   try {
     const started = performance.now();
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1, timeoutMs: 150 })),
-      expectCode('TIMEOUT'),
+    await expectFailure(
+      makeOptions(server.url, { requests: 1, timeoutMs: 150 }),
+      'TIMEOUT',
     );
     assert.ok(performance.now() - started < 3000);
   } finally {
@@ -522,7 +567,7 @@ test('таймаут срабатывает и при медленном тел�
   }
 });
 
-test('внешний AbortSignal прерывает прогон', async () => {
+test('внешний AbortSignal прерывает прогон с частичным отчётом', async () => {
   const server = await startServer(() => {
     // Намеренно не отвечаем.
   });
@@ -538,7 +583,11 @@ test('внешний AbortSignal прерывает прогон', async () => {
       }),
     );
     abortTimer = setTimeout(() => controller.abort(new BenchError('ABORTED', 'остановлено тестом')), 50);
-    await assert.rejects(promise, expectCode('ABORTED'));
+    const report = await promise;
+    assert.equal(report.ok, false);
+    assert.equal(report.error.code, 'ABORTED');
+    assert.equal(report.completedRequests, 0);
+    assert.equal(report.failedAt, 1);
   } finally {
     clearTimeout(abortTimer);
     await server.close();
@@ -553,11 +602,12 @@ test('без --allow-private локальный адрес блокируетс�
   });
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(server.url, { requests: 1, allowPrivate: false })),
-      expectCode('BLOCKED_ADDRESS'),
+    const report = await expectFailure(
+      makeOptions(server.url, { requests: 1, allowPrivate: false }),
+      'BLOCKED_ADDRESS',
     );
     assert.equal(served, 0);
+    assert.equal(report.completedRequests, 0);
   } finally {
     await server.close();
   }
@@ -569,9 +619,9 @@ test('--allow-private: false блокирует localhost по результа�
   const target = new URL(`http://localhost:${port}/`);
 
   try {
-    await assert.rejects(
-      runBenchmark(makeOptions(target.href, { requests: 1, allowPrivate: false })),
-      expectCode('BLOCKED_ADDRESS'),
+    await expectFailure(
+      makeOptions(target.href, { requests: 1, allowPrivate: false }),
+      'BLOCKED_ADDRESS',
     );
   } finally {
     await server.close();
@@ -624,9 +674,38 @@ test('main: ошибка HTTP в --json режиме', async () => {
     );
 
     assert.equal(code, 1);
+    assert.equal(stderr.join(''), '');
     const payload = JSON.parse(stdout.join(''));
     assert.equal(payload.ok, false);
     assert.equal(payload.error.code, 'HTTP_STATUS');
+    assert.equal(payload.completedRequests, 0);
+    assert.equal(payload.failedAt, 1);
+    assert.deepEqual(payload.perRequest, []);
+    assert.equal(payload.totalBytes, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('main: текстовый частичный отчёт при ошибке', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(500);
+    response.end();
+  });
+
+  try {
+    const stdout = [];
+    const stderr = [];
+    const code = await main(
+      ['--allow-private', '--requests', '2', server.url],
+      { stdout: writeTo(stdout), stderr: writeTo(stderr) },
+    );
+
+    assert.equal(code, 1);
+    const text = stdout.join('');
+    assert.match(text, /Частичный итог \(0 из 2\)/);
+    assert.match(text, /Ошибка \[HTTP_STATUS\] на запросе 1/);
+    assert.match(text, /В отчёт включены только успешно завершённые запросы/);
   } finally {
     await server.close();
   }

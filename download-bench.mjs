@@ -848,6 +848,10 @@ async function downloadOnce(target, options, parentSignal) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Запускает N последовательных запросов. Ошибка отдельного запроса не
+ * уничтожает уже собранные измерения: функция возвращает частичный отчёт с
+ * `ok: false`, `error`, `failedAt` и `perRequest` по завершённым запросам.
+ *
  * @param {object} options результат parseArgs (+ lookup, agents, signal)
  * @returns {Promise<object>} машинно-читаемый отчёт
  */
@@ -868,12 +872,24 @@ export async function runBenchmark(options) {
 
   const perRequest = [];
   const startedAt = performance.now();
+  let failure = null;
 
   try {
     for (let index = 1; index <= options.requests; index += 1) {
-      if (options.signal?.aborted) throw abortReason(options.signal);
-      const result = await downloadOnce(options.target, runOptions, options.signal);
-      perRequest.push({ index, ...result });
+      try {
+        if (options.signal?.aborted) throw abortReason(options.signal);
+        const result = await downloadOnce(options.target, runOptions, options.signal);
+        perRequest.push({ index, ...result });
+      } catch (error) {
+        failure = {
+          index,
+          error:
+            error instanceof BenchError
+              ? error
+              : new BenchError('ERROR', error?.message ?? String(error), { cause: error }),
+        };
+        break;
+      }
     }
   } finally {
     agents.http.destroy();
@@ -882,7 +898,7 @@ export async function runBenchmark(options) {
 
   const totalTimeMs = performance.now() - startedAt;
   const summary = summarize(perRequest, totalTimeMs);
-  return buildReport(options, perRequest, summary);
+  return buildReport(options, perRequest, summary, failure);
 }
 
 export function summarize(perRequest, totalTimeMs) {
@@ -914,16 +930,21 @@ export function summarize(perRequest, totalTimeMs) {
   };
 }
 
-function buildReport(options, perRequest, summary) {
-  const last = perRequest[perRequest.length - 1];
+function buildReport(options, perRequest, summary, failure = null) {
+  const last = perRequest.length > 0 ? perRequest[perRequest.length - 1] : null;
+  const error = failure?.error ?? null;
+
   return {
-    ok: true,
+    ok: error === null,
     target: options.target.href,
-    finalUrl: last.finalUrl,
-    status: last.status,
-    contentType: last.contentType || null,
-    contentEncoding: last.contentEncoding,
+    finalUrl: last?.finalUrl ?? null,
+    status: last?.status ?? null,
+    contentType: last?.contentType || null,
+    contentEncoding: last?.contentEncoding ?? null,
     requests: options.requests,
+    completedRequests: perRequest.length,
+    failedAt: failure?.index ?? null,
+    error: error ? { code: error.code, message: error.message } : null,
     totalBytes: summary.totalBytes,
     totalTimeMs: round(summary.totalTimeMs),
     avgRequestMs: round(summary.avgRequestMs),
@@ -949,23 +970,35 @@ function buildReport(options, perRequest, summary) {
 }
 
 export function formatReport(report) {
+  const partial = report.ok === false;
   const lines = [];
   lines.push(`Цель:        ${sanitizeForTerminal(report.target)}`);
-  if (report.finalUrl !== report.target) {
+  if (report.finalUrl && report.finalUrl !== report.target) {
     lines.push(`Итоговый URL: ${sanitizeForTerminal(report.finalUrl)}`);
   }
   lines.push(`Запросов:    ${report.requests} (последовательно, каждый до полного конца тела)`);
-  lines.push('');
-  lines.push('   #  время          байт              скорость');
-  lines.push('  ---  -------------  ----------------  ----------------');
-  for (const item of report.perRequest) {
-    const index = String(item.index).padStart(2);
+  if (partial) {
     lines.push(
-      `  ${index}  ${formatMs(item.durationMs).padEnd(13)}  ${formatBytes(item.bytes).padEnd(16)}  ${formatSpeed(item.bytes, item.durationMs)}`,
+      `Завершено:   ${report.completedRequests} из ${report.requests}; остановка на запросе ${report.failedAt ?? '—'}`,
     );
   }
+
+  if (report.perRequest.length > 0) {
+    lines.push('');
+    lines.push('   #  время          байт              скорость');
+    lines.push('  ---  -------------  ----------------  ----------------');
+    for (const item of report.perRequest) {
+      const index = String(item.index).padStart(2);
+      lines.push(
+        `  ${index}  ${formatMs(item.durationMs).padEnd(13)}  ${formatBytes(item.bytes).padEnd(16)}  ${formatSpeed(item.bytes, item.durationMs)}`,
+      );
+    }
+  }
+
   lines.push('');
-  lines.push('Итог:');
+  lines.push(
+    partial ? `Частичный итог (${report.completedRequests} из ${report.requests}):` : 'Итог:',
+  );
   lines.push(`  Скачано всего:   ${formatBytes(report.totalBytes)} (${formatInteger(report.totalBytes)} байт)`);
   lines.push(`  Общее время:     ${formatMs(report.totalTimeMs)}`);
   lines.push(`  Среднее время:   ${formatMs(report.avgRequestMs)}`);
@@ -978,6 +1011,13 @@ export function formatReport(report) {
     lines.push(
       `  Примечание:      сервер вернул Content-Encoding: ${sanitizeForTerminal(report.contentEncoding, 50)}; считаны байты на проводе (сжатые).`,
     );
+  }
+  if (partial) {
+    lines.push('');
+    lines.push(
+      `Ошибка [${report.error?.code ?? 'ERROR'}] на запросе ${report.failedAt ?? '—'}: ${sanitizeForTerminal(report.error?.message ?? '')}`,
+    );
+    lines.push('В отчёт включены только успешно завершённые запросы.');
   }
   lines.push('');
   lines.push('Единицы: 1 МиБ = 1 048 576 байт; 1 Мбит = 1 000 000 бит. Среднее время — на один запрос целиком.');
@@ -1056,6 +1096,13 @@ export async function main(argv = process.argv.slice(2), io = {}) {
       stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     } else {
       stdout.write(`${formatReport(report)}\n`);
+    }
+
+    if (report.ok === false) {
+      if (!options.json && report.error?.code === 'BLOCKED_ADDRESS') {
+        stderr.write('Подсказка: для локальных тестов есть флаг --allow-private (небезопасно).\n');
+      }
+      return report.error?.code === 'ABORTED' ? 130 : 1;
     }
     return 0;
   } catch (error) {
