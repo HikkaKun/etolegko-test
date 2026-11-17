@@ -1,4 +1,4 @@
-# alexander
+# etolegko-test
 
 Working repository for the agentic-git demo: code is written here, then
 committed and reviewed with the `commit` / `commit_apply` / `review` tools of
