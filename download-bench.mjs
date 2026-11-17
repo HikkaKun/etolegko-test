@@ -73,16 +73,23 @@ export class UsageError extends BenchError {
 // ---------------------------------------------------------------------------
 
 /**
- * Убирает управляющие символы из строк, полученных от сервера или из URL,
- * чтобы они не могли вставить ANSI-последовательности в терминал.
+ * Убирает управляющие и bidi-символы из строк, полученных от сервера или из
+ * URL, чтобы они не могли вставить ANSI-последовательности или визуально
+ * «перевернуть» текст в терминале.
  */
 export function sanitizeForTerminal(value, maxLength = 500) {
   let text = String(value ?? '');
   if (text.length > maxLength) text = `${text.slice(0, maxLength)}…`;
-  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, (char) => {
-    const hex = char.codePointAt(0).toString(16).padStart(2, '0');
-    return `\\x${hex}`;
-  });
+  return text.replace(
+    // C0/C1, ESC, ARABIC LETTER MARK, LRM/RLM, LRE/RLE/PDF/LRO/RLO,
+    // LINE/PARAGRAPH SEPARATOR, LRI/RLI/FSI/PDI.
+    /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069]/g,
+    (char) => {
+      const codePoint = char.codePointAt(0);
+      const hex = codePoint.toString(16);
+      return codePoint <= 0xff ? `\\x${hex.padStart(2, '0')}` : `\\u${hex.padStart(4, '0')}`;
+    },
+  );
 }
 
 function formatInteger(value) {
@@ -872,6 +879,9 @@ async function downloadOnce(target, options, parentSignal) {
 export async function runBenchmark(options) {
   if (!(options.target instanceof URL)) {
     throw new TypeError('options.target должен быть объектом URL');
+  }
+  if (!Number.isSafeInteger(options.requests) || options.requests < 1) {
+    throw new RangeError('options.requests должен быть целым числом не меньше 1');
   }
 
   const agents = {

@@ -10,6 +10,7 @@ import {
   main,
   parseArgs,
   runBenchmark,
+  sanitizeForTerminal,
 } from '../download-bench.mjs';
 
 const MIB = 1024 * 1024;
@@ -208,6 +209,58 @@ test('публичные адреса не блокируются', () => {
     assert.equal(blockedAddressReason(address), null);
   }
   assert.equal(isPublicAddress('not-an-ip'), false);
+});
+
+// ---------------------------------------------------------------------------
+// Защита вывода
+// ---------------------------------------------------------------------------
+
+test('sanitizeForTerminal: C0/C1, ESC и bidi-контролы', () => {
+  const input = [
+    '\u001b[31mred',
+    '\u009b',
+    '\u061c',
+    '\u200e',
+    '\u200f',
+    '\u202a',
+    '\u202b',
+    '\u202c',
+    '\u202d',
+    '\u202e',
+    '\u2066',
+    '\u2067',
+    '\u2068',
+    '\u2069',
+    '\u2028',
+    '\u2029',
+    'done',
+  ].join('');
+
+  const output = sanitizeForTerminal(input);
+  assert.doesNotMatch(
+    output,
+    /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069]/,
+  );
+  assert.match(output, /\\x1b\[31mred/);
+  assert.match(output, /\\x9b/);
+  assert.match(output, /\\u061c/);
+  assert.match(output, /\\u202e/);
+  assert.match(output, /\\u2066/);
+  assert.match(output, /\\u2028/);
+});
+
+test('runBenchmark: requests = 0 отклоняется, а не падает с TypeError', async () => {
+  await assert.rejects(
+    runBenchmark({
+      target: new URL('http://127.0.0.1:1/'),
+      requests: 0,
+      timeoutMs: 1000,
+      maxBytes: 1024,
+      maxRedirects: 0,
+      allowPrivate: true,
+    }),
+    (error) => error instanceof RangeError && /options\.requests/.test(error.message),
+  );
 });
 
 // ---------------------------------------------------------------------------
