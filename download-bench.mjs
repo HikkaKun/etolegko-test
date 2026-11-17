@@ -136,12 +136,26 @@ function createDefaultOptions() {
   };
 }
 
+function hasHelpFlag(argv) {
+  for (const argument of argv) {
+    if (argument === '--') return false;
+    if (argument === '-h' || argument === '--help') return true;
+  }
+  return false;
+}
+
 /**
  * @param {string[]} argv аргументы без node и имени скрипта
  * @returns {object} разобранные и проверенные опции
  */
 export function parseArgs(argv) {
   const options = createDefaultOptions();
+  // Справка приоритетнее ошибок в остальных аргументах, независимо от их
+  // порядка. Токены после `--` уже не считаются флагами.
+  if (hasHelpFlag(argv)) {
+    options.help = true;
+    return options;
+  }
   try {
     return parseArgsInto(argv, options);
   } catch (error) {

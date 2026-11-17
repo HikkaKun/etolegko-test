@@ -125,6 +125,19 @@ test('parseArgs: -h приоритетнее ошибок разбора', () =>
   assert.equal(options.target, null);
 });
 
+test('parseArgs: --help приоритетнее ошибок, идущих до него', () => {
+  const options = parseArgs(['--bad-flag', '--timeout', 'abc', '--help']);
+  assert.equal(options.help, true);
+  assert.equal(options.target, null);
+});
+
+test('parseArgs: --help после -- уже не флаг', () => {
+  assert.throws(
+    () => parseArgs(['--', '--help']),
+    (error) => error instanceof BenchError && error.code === 'USAGE',
+  );
+});
+
 test('parseArgs: --version работает без URL', () => {
   const options = parseArgs(['--version']);
   assert.equal(options.version, true);
@@ -764,6 +777,18 @@ test('main: --version', async () => {
   });
   assert.equal(code, 0);
   assert.match(stdout.join(''), /^download-bench \d+\.\d+\.\d+\n$/);
+  assert.equal(stderr.join(''), '');
+});
+
+test('main: --help приоритетнее ошибки до него', async () => {
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--bad-flag', '--help'], {
+    stdout: writeTo(stdout),
+    stderr: writeTo(stderr),
+  });
+  assert.equal(code, 0);
+  assert.match(stdout.join(''), /Использование:/);
   assert.equal(stderr.join(''), '');
 });
 
