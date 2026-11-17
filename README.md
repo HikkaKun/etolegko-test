@@ -61,7 +61,8 @@ node download-bench.mjs --allow-private http://127.0.0.1:8080/file.bin
 | `--max-redirects <N>` | целое `0..20` | `5` | максимум редиректов на один запрос |
 | `--allow-private` | флаг | выключен | разрешить loopback/частные/служебные адреса. **Небезопасно**, только для локальных тестов |
 | `--json` | флаг | выключен | вывести отчёт в JSON вместо текста |
-| `-h`, `--help` | флаг | — | показать справку |
+| `-h`, `--help` | флаг | — | показать справку (приоритетнее ошибок в других аргументах) |
+| `-v`, `--version` | флаг | — | показать версию |
 
 Значения можно передавать как `--requests 3`, так и `--requests=3`.
 
@@ -82,6 +83,16 @@ node download-bench.mjs --allow-private http://127.0.0.1:8080/file.bin
   `Accept-Encoding: identity`, чтобы сервер не сжимал ответ. Если сервер всё
   равно сжал его (`Content-Encoding: gzip` и т.п.), считаются байты на проводе
   (сжатые), а в отчёте появляется примечание об этом.
+
+В JSON-отчёте есть явные маркеры:
+
+- `compressed: true` — хотя бы один ответ пришёл с `Content-Encoding`, отличным
+  от `identity`; `totalBytes` в этом случае — байты на проводе (сжатые), а не
+  размер распакованного payload. У каждого элемента `perRequest` есть своё поле
+  `contentEncoding`.
+- `allowPrivate: true` — использовался `--allow-private`; замер относится к
+  локальному/внутреннему адресу и не показательен для публичной сети.
+  В текстовом отчёте для этого печатается строка `Режим: --allow-private ...`.
 
 ## Пример вывода
 
@@ -263,8 +274,10 @@ TLS-handshake, а последующие запросы могут переис�
   "requests": 10,
   "completedRequests": 4,
   "failedAt": 5,
+  "compressed": false,
+  "allowPrivate": false,
   "error": { "code": "HTTP_STATUS", "message": "Сервер ответил HTTP 503..." },
-  "perRequest": [{ "index": 1, "bytes": 1048576, "durationMs": 123.4 }]
+  "perRequest": [{ "index": 1, "bytes": 1048576, "durationMs": 123.4, "contentEncoding": null }]
 }
 ```
 
@@ -287,6 +300,8 @@ node --test test/
   разрешение публичных;
 - очистку вывода от C0/C1, ANSI-escape и bidi-контролов;
 - валидацию `requests >= 1` при вызове `runBenchmark` как библиотеки;
+- приоритет `-h/--help`, работу `--version`, маркеры `compressed` и
+  `allowPrivate`;
 - строгую последовательность запросов;
 - подсчёт байт и времени, пустой ответ `204`;
 - `4xx`/`5xx`, таймаут, превышение `Content-Length` и chunked-лимита,
@@ -298,6 +313,7 @@ node --test test/
 - блокировку loopback без `--allow-private` (в том числе через DNS для
   `localhost`);
 - таймаут на заголовки и на медленное тело;
+- прерывание через внешний `AbortSignal`, в том числе на уровне `main`;
 - текстовый и JSON-вывод CLI, включая ошибки аргументов в JSON-режиме и
   отсутствие JSON-режима при неверном флаге (`--json=foo`).
 

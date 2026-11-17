@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
+import zlib from 'node:zlib';
 
 import {
   BenchError,
@@ -81,6 +82,7 @@ test('parseArgs: значения по умолчанию', () => {
   assert.equal(options.allowPrivate, false);
   assert.equal(options.json, false);
   assert.equal(options.help, false);
+  assert.equal(options.version, false);
   assert.equal(options.target.href, 'https://example.com/image.png');
 });
 
@@ -114,6 +116,18 @@ test('parseArgs: фрагмент URL отбрасывается, query сохр
 test('parseArgs: --help работает без URL', () => {
   const options = parseArgs(['--help']);
   assert.equal(options.help, true);
+  assert.equal(options.target, null);
+});
+
+test('parseArgs: -h приоритетнее ошибок разбора', () => {
+  const options = parseArgs(['-h', '--bad-flag']);
+  assert.equal(options.help, true);
+  assert.equal(options.target, null);
+});
+
+test('parseArgs: --version работает без URL', () => {
+  const options = parseArgs(['--version']);
+  assert.equal(options.version, true);
   assert.equal(options.target, null);
 });
 
@@ -298,6 +312,9 @@ test('скачивает N раз последовательно, считает
     assert.equal(report.requests, 3);
     assert.equal(report.status, 200);
     assert.equal(report.contentType, 'image/png');
+    assert.equal(report.compressed, false);
+    assert.equal(report.allowPrivate, true);
+    assert.match(formatReport(report), /--allow-private/);
     assert.equal(report.totalBytes, body.length * 3);
     assert.equal(report.perRequest.length, 3);
     assert.deepEqual(
@@ -329,6 +346,30 @@ test('пустой ответ 204 — это успех с нулевым объ
     assert.equal(report.totalBytes, 0);
     assert.equal(report.throughput.mibPerSecond, 0);
     assert.ok(Number.isFinite(report.throughput.mibPerSecond));
+  } finally {
+    await server.close();
+  }
+});
+
+test('сжатый ответ помечается compressed, объём считается по байтам на проводе', async () => {
+  const payload = Buffer.from('a'.repeat(10_000));
+  const gzipped = zlib.gzipSync(payload);
+  const server = await startServer((request, response) => {
+    response.writeHead(200, {
+      'content-encoding': 'gzip',
+      'content-length': gzipped.length,
+    });
+    response.end(gzipped);
+  });
+
+  try {
+    const report = await runBenchmark(makeOptions(server.url, { requests: 1 }));
+    assert.equal(report.ok, true);
+    assert.equal(report.compressed, true);
+    assert.equal(report.contentEncoding, 'gzip');
+    assert.equal(report.totalBytes, gzipped.length);
+    assert.equal(report.perRequest[0].contentEncoding, 'gzip');
+    assert.match(formatReport(report), /сжаты/);
   } finally {
     await server.close();
   }
@@ -706,10 +747,24 @@ test('main: --json печатает машинно-читаемый отчёт',
     assert.equal(report.ok, true);
     assert.equal(report.requests, 1);
     assert.equal(report.totalBytes, body.length);
+    assert.equal(report.allowPrivate, true);
+    assert.equal(report.compressed, false);
     assert.match(report.units.throughput, /МиБ\/с/);
   } finally {
     await server.close();
   }
+});
+
+test('main: --version', async () => {
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--version'], {
+    stdout: writeTo(stdout),
+    stderr: writeTo(stderr),
+  });
+  assert.equal(code, 0);
+  assert.match(stdout.join(''), /^download-bench \d+\.\d+\.\d+\n$/);
+  assert.equal(stderr.join(''), '');
 });
 
 test('main: ошибка HTTP в --json режиме', async () => {
@@ -760,6 +815,37 @@ test('main: текстовый частичный отчёт при ошибке
     assert.match(text, /Ошибка \[HTTP_STATUS\] на запросе 1/);
     assert.match(text, /В отчёт включены только успешно завершённые запросы/);
   } finally {
+    await server.close();
+  }
+});
+
+test('main: внешний signal даёт частичный отчёт и код 130', async () => {
+  const server = await startServer(() => {
+    // Намеренно не отвечаем.
+  });
+  const controller = new AbortController();
+  const stdout = [];
+  const stderr = [];
+  let timer;
+
+  try {
+    timer = setTimeout(() => controller.abort(new BenchError('ABORTED', 'остановлено тестом')), 50);
+    const code = await main(
+      ['--json', '--allow-private', '--requests', '2', server.url],
+      {
+        stdout: writeTo(stdout),
+        stderr: writeTo(stderr),
+        signal: controller.signal,
+      },
+    );
+
+    assert.equal(code, 130);
+    const payload = JSON.parse(stdout.join(''));
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, 'ABORTED');
+    assert.equal(payload.completedRequests, 0);
+  } finally {
+    clearTimeout(timer);
     await server.close();
   }
 });

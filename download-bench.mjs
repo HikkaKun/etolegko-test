@@ -132,6 +132,7 @@ function createDefaultOptions() {
     allowPrivate: false,
     json: false,
     help: false,
+    version: false,
   };
 }
 
@@ -201,7 +202,14 @@ function parseArgsInto(argv, options) {
       case '--help':
         ensureNoInlineValue(flag, inlineValue);
         options.help = true;
-        break;
+        // Справка приоритетнее остальных аргументов: не заставляем
+        // пользователя исправлять опечатки в других флагах.
+        return options;
+      case '-v':
+      case '--version':
+        ensureNoInlineValue(flag, inlineValue);
+        options.version = true;
+        return options;
       case '--json':
         ensureNoInlineValue(flag, inlineValue);
         options.json = true;
@@ -666,6 +674,27 @@ function readBody(response, { maxBytes, contentLength, signal }) {
       return;
     }
     signal.addEventListener('abort', onAbort, { once: true });
+    // Повторная проверка на случай, если сигнал был прерван между проверкой
+    // и подпиской (на будущее, если между этими строками появится await).
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+
+    const finishComplete = () => {
+      if (contentLength !== null && bytes < contentLength) {
+        finish(
+          reject,
+          new BenchError(
+            'TRUNCATED',
+            `Получено ${formatInteger(bytes)} из ${formatInteger(contentLength)} байт: ответ оборван.`,
+            { details: { bytes, contentLength } },
+          ),
+        );
+        return;
+      }
+      finish(resolve, bytes);
+    };
 
     if (contentLength !== null && contentLength > maxBytes) {
       finish(
@@ -681,6 +710,7 @@ function readBody(response, { maxBytes, contentLength, signal }) {
     }
 
     response.on('data', (chunk) => {
+      if (settled) return;
       bytes += chunk.length;
       if (bytes > maxBytes) {
         finish(
@@ -700,18 +730,7 @@ function readBody(response, { maxBytes, contentLength, signal }) {
         finish(reject, new BenchError('TRUNCATED', 'Соединение закрылось раньше конца тела ответа.'));
         return;
       }
-      if (contentLength !== null && bytes < contentLength) {
-        finish(
-          reject,
-          new BenchError(
-            'TRUNCATED',
-            `Получено ${formatInteger(bytes)} из ${formatInteger(contentLength)} байт: ответ оборван.`,
-            { details: { bytes, contentLength } },
-          ),
-        );
-        return;
-      }
-      finish(resolve, bytes);
+      finishComplete();
     });
 
     response.on('aborted', () => {
@@ -723,14 +742,19 @@ function readBody(response, { maxBytes, contentLength, signal }) {
     });
 
     response.on('close', () => {
-      if (!settled) {
-        finish(
-          reject,
-          signal.aborted
-            ? abortReason(signal)
-            : new BenchError('TRUNCATED', 'Соединение закрыто до завершения ответа.'),
-        );
+      if (settled) return;
+      if (response.complete) {
+        // 'close' может прийти раньше 'end' при destroy() со стороны сервера
+        // или клиента, хотя тело уже дочитано. Не считаем такой ответ обрывом.
+        finishComplete();
+        return;
       }
+      finish(
+        reject,
+        signal.aborted
+          ? abortReason(signal)
+          : new BenchError('TRUNCATED', 'Соединение закрыто до завершения ответа.'),
+      );
     });
   });
 }
@@ -859,7 +883,7 @@ async function downloadOnce(target, options, parentSignal) {
       parentSignal?.removeEventListener('abort', onParentAbort);
       // Если тело не дочитано (ошибка, редирект, лимит), закрываем сокет.
       // Успешно прочитанный ответ оставляем в keep-alive пуле агента.
-      if (!request?.response?.complete) request?.request.destroy();
+      if (!request?.response?.complete) request?.request?.destroy();
     }
   }
 }
@@ -957,6 +981,9 @@ export function summarize(perRequest, totalTimeMs) {
 function buildReport(options, perRequest, summary, failure = null) {
   const last = perRequest.length > 0 ? perRequest[perRequest.length - 1] : null;
   const error = failure?.error ?? null;
+  const compressed = perRequest.some(
+    (item) => item.contentEncoding !== null && item.contentEncoding !== 'identity',
+  );
 
   return {
     ok: error === null,
@@ -965,6 +992,8 @@ function buildReport(options, perRequest, summary, failure = null) {
     status: last?.status ?? null,
     contentType: last?.contentType || null,
     contentEncoding: last?.contentEncoding ?? null,
+    compressed,
+    allowPrivate: options.allowPrivate === true,
     requests: options.requests,
     completedRequests: perRequest.length,
     failedAt: failure?.index ?? null,
@@ -989,6 +1018,7 @@ function buildReport(options, perRequest, summary, failure = null) {
       index: item.index,
       bytes: item.bytes,
       durationMs: round(item.durationMs),
+      contentEncoding: item.contentEncoding ?? null,
     })),
   };
 }
@@ -1001,6 +1031,11 @@ export function formatReport(report) {
     lines.push(`Итоговый URL: ${sanitizeForTerminal(report.finalUrl)}`);
   }
   lines.push(`Запросов:    ${report.requests} (последовательно, каждый до полного конца тела)`);
+  if (report.allowPrivate) {
+    lines.push(
+      'Режим:       --allow-private (локальная/внутренняя цель; результат не показателен для публичной сети)',
+    );
+  }
   if (partial) {
     lines.push(
       `Завершено:   ${report.completedRequests} из ${report.requests}; остановка на запросе ${report.failedAt ?? '—'}`,
@@ -1031,9 +1066,13 @@ export function formatReport(report) {
   lines.push(
     `  Скорость:        ${report.throughput.mibPerSecond.toFixed(2)} МиБ/с (${report.throughput.mbitPerSecond.toFixed(2)} Мбит/с)`,
   );
-  if (report.contentEncoding && report.contentEncoding !== 'identity') {
+  if (report.compressed) {
+    const encoding =
+      report.contentEncoding && report.contentEncoding !== 'identity'
+        ? `Content-Encoding: ${sanitizeForTerminal(report.contentEncoding, 50)}`
+        : 'сжатие';
     lines.push(
-      `  Примечание:      сервер вернул Content-Encoding: ${sanitizeForTerminal(report.contentEncoding, 50)}; считаны байты на проводе (сжатые).`,
+      `  Примечание:      ${encoding}; считаны байты на проводе (сжатые).`,
     );
   }
   if (partial) {
@@ -1065,6 +1104,7 @@ const HELP_TEXT = `download-bench ${VERSION} — последовательны�
       --allow-private      разрешить loopback/частные адреса (НЕБЕЗОПАСНО; только для локальных тестов)
       --json               вывести отчёт в JSON
   -h, --help               показать эту справку
+  -v, --version            показать версию
 
 Примеры:
   node download-bench.mjs https://example.com/image.jpg
@@ -1077,7 +1117,7 @@ const HELP_TEXT = `download-bench ${VERSION} — последовательны�
 
 /**
  * @param {string[]} argv
- * @param {{stdout?: NodeJS.WritableStream, stderr?: NodeJS.WritableStream}} [io]
+ * @param {{stdout?: NodeJS.WritableStream, stderr?: NodeJS.WritableStream, signal?: AbortSignal}} [io]
  * @returns {Promise<number>} код выхода
  */
 export async function main(argv = process.argv.slice(2), io = {}) {
@@ -1110,12 +1150,13 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     return 0;
   }
 
-  const controller = new AbortController();
-  const onSigint = () => controller.abort(new BenchError('ABORTED', 'Прервано пользователем (SIGINT)'));
-  process.once('SIGINT', onSigint);
+  if (options.version) {
+    stdout.write(`download-bench ${VERSION}\n`);
+    return 0;
+  }
 
   try {
-    const report = await runBenchmark({ ...options, signal: controller.signal });
+    const report = await runBenchmark({ ...options, signal: io.signal });
     if (options.json) {
       stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     } else {
@@ -1150,8 +1191,6 @@ export async function main(argv = process.argv.slice(2), io = {}) {
       }
     }
     return benchError.code === 'ABORTED' ? 130 : 1;
-  } finally {
-    process.removeListener('SIGINT', onSigint);
   }
 }
 
@@ -1165,10 +1204,15 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
+  const controller = new AbortController();
+  const onSigint = () => controller.abort(new BenchError('ABORTED', 'Прервано пользователем (SIGINT)'));
+  process.once('SIGINT', onSigint);
   try {
-    process.exitCode = await main();
+    process.exitCode = await main(process.argv.slice(2), { signal: controller.signal });
   } catch (error) {
     process.stderr.write(`Непредвиденная ошибка: ${sanitizeForTerminal(error?.stack ?? String(error))}\n`);
     process.exitCode = 1;
+  } finally {
+    process.removeListener('SIGINT', onSigint);
   }
 }
