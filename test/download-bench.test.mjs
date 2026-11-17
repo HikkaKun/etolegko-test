@@ -1,0 +1,680 @@
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import test from 'node:test';
+
+import {
+  BenchError,
+  blockedAddressReason,
+  formatReport,
+  isPublicAddress,
+  main,
+  parseArgs,
+  runBenchmark,
+} from '../download-bench.mjs';
+
+const MIB = 1024 * 1024;
+
+async function startServer(handler) {
+  const server = http.createServer(handler);
+  server.on('clientError', (error, socket) => {
+    socket.destroy();
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = server.address();
+  return {
+    server,
+    url: `http://127.0.0.1:${port}`,
+    async close() {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+function makeOptions(url, overrides = {}) {
+  return {
+    target: new URL(url),
+    requests: 2,
+    timeoutMs: 3000,
+    maxBytes: 32 * MIB,
+    maxRedirects: 5,
+    allowPrivate: true,
+    ...overrides,
+  };
+}
+
+function expectCode(code) {
+  return (error) => error instanceof BenchError && error.code === code;
+}
+
+function writeTo(chunks) {
+  return {
+    write(value) {
+      chunks.push(String(value));
+      return true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Аргументы и URL
+// ---------------------------------------------------------------------------
+
+test('parseArgs: значения по умолчанию', () => {
+  const options = parseArgs(['https://example.com/image.png']);
+  assert.equal(options.requests, 10);
+  assert.equal(options.timeoutMs, 60_000);
+  assert.equal(options.maxBytes, 512 * MIB);
+  assert.equal(options.maxRedirects, 5);
+  assert.equal(options.allowPrivate, false);
+  assert.equal(options.json, false);
+  assert.equal(options.help, false);
+  assert.equal(options.target.href, 'https://example.com/image.png');
+});
+
+test('parseArgs: флаги, = и значения', () => {
+  const options = parseArgs([
+    '--requests=2',
+    '-t',
+    '500',
+    '--max-bytes',
+    '1024',
+    '--max-redirects',
+    '0',
+    '--json',
+    '--allow-private',
+    'http://example.com/a.png',
+  ]);
+  assert.equal(options.requests, 2);
+  assert.equal(options.timeoutMs, 500);
+  assert.equal(options.maxBytes, 1024);
+  assert.equal(options.maxRedirects, 0);
+  assert.equal(options.json, true);
+  assert.equal(options.allowPrivate, true);
+});
+
+test('parseArgs: фрагмент URL отбрасывается, query сохраняется', () => {
+  const options = parseArgs(['https://example.com/a.png?x=1#section']);
+  assert.equal(options.target.hash, '');
+  assert.equal(options.target.search, '?x=1');
+});
+
+test('parseArgs: --help работает без URL', () => {
+  const options = parseArgs(['--help']);
+  assert.equal(options.help, true);
+  assert.equal(options.target, null);
+});
+
+test('parseArgs: некорректные аргументы', () => {
+  const cases = [
+    [],
+    ['ftp://example.com/file'],
+    ['file:///etc/passwd'],
+    ['javascript:alert(1)'],
+    ['http://user:pass@example.com/'],
+    ['http://example.com:0/'],
+    ['http://example.com/a', 'http://example.com/b'],
+    ['--requests', '0', 'http://example.com/'],
+    ['--requests', '1.5', 'http://example.com/'],
+    ['--requests', 'abc', 'http://example.com/'],
+    ['--timeout', '0', 'http://example.com/'],
+    ['--max-bytes', '-1', 'http://example.com/'],
+    ['--max-redirects', '999', 'http://example.com/'],
+    ['--bogus', 'http://example.com/'],
+    ['http://example.com/\n'],
+  ];
+  for (const argv of cases) {
+    assert.throws(() => parseArgs(argv), (error) => error instanceof BenchError && error.code === 'USAGE', argv.join(' '));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Классификация адресов
+// ---------------------------------------------------------------------------
+
+test('блокируются приватные, loopback и служебные адреса', () => {
+  const blocked = [
+    '0.0.0.0',
+    '10.0.0.1',
+    '100.64.0.1',
+    '127.0.0.1',
+    '127.1.2.3',
+    '169.254.169.254',
+    '172.16.0.1',
+    '172.31.255.255',
+    '192.0.0.1',
+    '192.0.2.5',
+    '192.88.99.1',
+    '192.168.1.1',
+    '198.18.0.1',
+    '198.51.100.7',
+    '203.0.113.9',
+    '224.0.0.1',
+    '240.0.0.1',
+    '255.255.255.255',
+    '::',
+    '::1',
+    '::ffff:127.0.0.1',
+    '::ffff:10.0.0.1',
+    '::ffff:192.168.0.1',
+    '::7f00:1',
+    '64:ff9b::a00:1',
+    'fe80::1',
+    'fc00::1',
+    'fd12:3456::1',
+    'ff02::1',
+    '2001:db8::1',
+    '2001:0::1',
+    '2001:2::1',
+    '2001:10::1',
+    '2001:20::1',
+    '2001:4:112::1',
+    '3fff::1',
+    '2002:7f00:1::',
+    '2002:c0a8:101::',
+  ];
+  for (const address of blocked) {
+    assert.equal(isPublicAddress(address), false, `${address} должен быть заблокирован`);
+    assert.ok(blockedAddressReason(address), `${address} должен иметь причину блокировки`);
+  }
+});
+
+test('публичные адреса не блокируются', () => {
+  const allowed = [
+    '1.1.1.1',
+    '8.8.8.8',
+    '8.8.4.4',
+    '93.184.216.34',
+    '185.199.108.153',
+    '208.67.222.222',
+    '2001:4860:4860::8888',
+    '2606:4700:4700::1111',
+    '2a03:2880:f10c:83:face:b00c:0:25de',
+    '::ffff:8.8.8.8',
+  ];
+  for (const address of allowed) {
+    assert.equal(isPublicAddress(address), true, `${address} должен быть разрешён`);
+    assert.equal(blockedAddressReason(address), null);
+  }
+  assert.equal(isPublicAddress('not-an-ip'), false);
+});
+
+// ---------------------------------------------------------------------------
+// Скачивание
+// ---------------------------------------------------------------------------
+
+test('скачивает N раз последовательно, считает байты и время', async () => {
+  let active = 0;
+  let maxActive = 0;
+  let served = 0;
+  const body = Buffer.alloc(1024, 0x61);
+
+  const server = await startServer((request, response) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    served += 1;
+    assert.equal(request.headers['accept-encoding'], 'identity');
+    assert.match(String(request.headers['user-agent']), /^download-bench\//);
+    response.writeHead(200, {
+      'content-type': 'image/png',
+      'content-length': body.length,
+    });
+    response.end(body);
+    response.on('finish', () => {
+      active -= 1;
+    });
+  });
+
+  try {
+    const report = await runBenchmark(
+      makeOptions(`${server.url}/image.png#frag`, { requests: 3 }),
+    );
+
+    assert.equal(report.ok, true);
+    assert.equal(report.requests, 3);
+    assert.equal(report.status, 200);
+    assert.equal(report.contentType, 'image/png');
+    assert.equal(report.totalBytes, body.length * 3);
+    assert.equal(report.perRequest.length, 3);
+    assert.deepEqual(
+      report.perRequest.map((item) => item.bytes),
+      [body.length, body.length, body.length],
+    );
+    assert.equal(served, 3);
+    assert.equal(maxActive, 1, 'запросы должны идти строго последовательно');
+    assert.ok(report.avgRequestMs >= 0);
+    assert.ok(report.medianRequestMs >= 0);
+    assert.ok(report.minRequestMs <= report.maxRequestMs);
+    assert.ok(report.throughput.mibPerSecond > 0);
+    assert.ok(Number.isFinite(report.throughput.mbitPerSecond));
+    assert.equal(JSON.parse(JSON.stringify(report)).ok, true);
+  } finally {
+    await server.close();
+  }
+});
+
+test('пустой ответ 204 — это успех с нулевым объёмом', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(204);
+    response.end();
+  });
+
+  try {
+    const report = await runBenchmark(makeOptions(server.url, { requests: 1 }));
+    assert.equal(report.status, 204);
+    assert.equal(report.totalBytes, 0);
+    assert.equal(report.throughput.mibPerSecond, 0);
+    assert.ok(Number.isFinite(report.throughput.mibPerSecond));
+  } finally {
+    await server.close();
+  }
+});
+
+test('HTTP 4xx/5xx — ошибка HTTP_STATUS', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(404, { 'content-type': 'text/plain' });
+    response.end('nope');
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1 })),
+      expectCode('HTTP_STATUS'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('таймаут на запрос целиком', async () => {
+  const server = await startServer(() => {
+    // Намеренно не отвечаем.
+  });
+
+  try {
+    const started = performance.now();
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1, timeoutMs: 150 })),
+      expectCode('TIMEOUT'),
+    );
+    assert.ok(performance.now() - started < 3000);
+  } finally {
+    await server.close();
+  }
+});
+
+test('Content-Length больше лимита — ошибка TOO_LARGE до чтения тела', async () => {
+  const server = await startServer((request, response) => {
+    response.on('error', () => {});
+    response.writeHead(200, { 'content-length': 4096 });
+    response.end(Buffer.alloc(4096));
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1, maxBytes: 1024 })),
+      expectCode('TOO_LARGE'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('chunked-ответ больше лимита — ошибка TOO_LARGE', async () => {
+  const server = await startServer((request, response) => {
+    response.on('error', () => {});
+    response.writeHead(200);
+    response.write(Buffer.alloc(2048));
+    response.end();
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1, maxBytes: 1024 })),
+      expectCode('TOO_LARGE'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('оборванный ответ — ошибка', async () => {
+  const server = await startServer((request, response) => {
+    response.on('error', () => {});
+    response.writeHead(200, { 'content-length': 1000 });
+    response.write(Buffer.alloc(100));
+    setTimeout(() => response.destroy(), 20);
+  });
+
+  try {
+    await assert.rejects(runBenchmark(makeOptions(server.url, { requests: 1 })), (error) => {
+      assert.ok(error instanceof BenchError);
+      assert.ok(['TRUNCATED', 'NETWORK'].includes(error.code), error.code);
+      return true;
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test('редиректы поддерживаются, время и байты считаются по финальному ответу', async () => {
+  const body = Buffer.alloc(512, 0x62);
+  const server = await startServer((request, response) => {
+    if (request.url === '/start') {
+      response.writeHead(302, { location: '/middle' });
+      response.end();
+      return;
+    }
+    if (request.url === '/middle') {
+      response.writeHead(301, { location: '/final' });
+      response.end();
+      return;
+    }
+    response.writeHead(200, {
+      'content-type': 'image/jpeg',
+      'content-length': body.length,
+    });
+    response.end(body);
+  });
+
+  try {
+    const report = await runBenchmark(
+      makeOptions(`${server.url}/start`, { requests: 2 }),
+    );
+    assert.equal(report.finalUrl, `${server.url}/final`);
+    assert.equal(report.totalBytes, body.length * 2);
+    assert.equal(report.status, 200);
+  } finally {
+    await server.close();
+  }
+});
+
+test('лимит редиректов', async () => {
+  const server = await startServer((request, response) => {
+    const url = new URL(request.url, 'http://placeholder');
+    const step = Number(url.searchParams.get('step') ?? '0');
+    response.writeHead(302, { location: `/r?step=${step + 1}` });
+    response.end();
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(`${server.url}/r`, { requests: 1, maxRedirects: 2 })),
+      expectCode('REDIRECT_LIMIT'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('цикл редиректов обнаруживается', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(302, { location: request.url === '/a' ? '/b' : '/a' });
+    response.end();
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(`${server.url}/a`, { requests: 1 })),
+      expectCode('REDIRECT_LOOP'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('редирект без Location — ошибка', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(302);
+    response.end();
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1 })),
+      expectCode('REDIRECT_NO_LOCATION'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('редирект на file:// запрещён', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(302, { location: 'file:///etc/passwd' });
+    response.end();
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1 })),
+      expectCode('REDIRECT_PROTOCOL'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('--max-redirects 0 запрещает даже один редирект', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(302, { location: '/target' });
+    response.end();
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1, maxRedirects: 0 })),
+      expectCode('REDIRECT_LIMIT'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test('учётные данные из Location не пересылаются', async () => {
+  let authorization = 'unset';
+  const server = await startServer((request, response) => {
+    if (request.url === '/start') {
+      response.writeHead(302, {
+        location: `http://user:pass@${request.headers.host}/final`,
+      });
+      response.end();
+      return;
+    }
+    authorization = request.headers.authorization ?? null;
+    response.writeHead(200, { 'content-length': 2 });
+    response.end('ok');
+  });
+
+  try {
+    const report = await runBenchmark(makeOptions(`${server.url}/start`, { requests: 1 }));
+    assert.equal(report.finalUrl, `${server.url}/final`);
+    assert.equal(authorization, null);
+  } finally {
+    await server.close();
+  }
+});
+
+test('таймаут срабатывает и при медленном теле ответа', async () => {
+  let timer;
+  const server = await startServer((request, response) => {
+    response.on('error', () => {});
+    response.writeHead(200, { 'content-length': 100_000 });
+    timer = setInterval(() => {
+      response.write(Buffer.alloc(10));
+    }, 30);
+    response.on('close', () => clearInterval(timer));
+  });
+
+  try {
+    const started = performance.now();
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1, timeoutMs: 150 })),
+      expectCode('TIMEOUT'),
+    );
+    assert.ok(performance.now() - started < 3000);
+  } finally {
+    if (timer) clearInterval(timer);
+    await server.close();
+  }
+});
+
+test('внешний AbortSignal прерывает прогон', async () => {
+  const server = await startServer(() => {
+    // Намеренно не отвечаем.
+  });
+  const controller = new AbortController();
+  let abortTimer;
+
+  try {
+    const promise = runBenchmark(
+      makeOptions(server.url, {
+        requests: 5,
+        timeoutMs: 5000,
+        signal: controller.signal,
+      }),
+    );
+    abortTimer = setTimeout(() => controller.abort(new BenchError('ABORTED', 'остановлено тестом')), 50);
+    await assert.rejects(promise, expectCode('ABORTED'));
+  } finally {
+    clearTimeout(abortTimer);
+    await server.close();
+  }
+});
+
+test('без --allow-private локальный адрес блокируется до запроса', async () => {
+  let served = 0;
+  const server = await startServer((request, response) => {
+    served += 1;
+    response.end('nope');
+  });
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(server.url, { requests: 1, allowPrivate: false })),
+      expectCode('BLOCKED_ADDRESS'),
+    );
+    assert.equal(served, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('--allow-private: false блокирует localhost по результату DNS', async () => {
+  const server = await startServer((request, response) => response.end('ok'));
+  const { port } = server.server.address();
+  const target = new URL(`http://localhost:${port}/`);
+
+  try {
+    await assert.rejects(
+      runBenchmark(makeOptions(target.href, { requests: 1, allowPrivate: false })),
+      expectCode('BLOCKED_ADDRESS'),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// CLI (main)
+// ---------------------------------------------------------------------------
+
+test('main: --json печатает машинно-читаемый отчёт', async () => {
+  const body = Buffer.alloc(256, 0x63);
+  const server = await startServer((request, response) => {
+    response.writeHead(200, { 'content-length': body.length });
+    response.end(body);
+  });
+
+  try {
+    const stdout = [];
+    const stderr = [];
+    const code = await main(
+      ['--json', '--allow-private', '--requests', '1', server.url],
+      { stdout: writeTo(stdout), stderr: writeTo(stderr) },
+    );
+
+    assert.equal(code, 0);
+    assert.equal(stderr.join(''), '');
+    const report = JSON.parse(stdout.join(''));
+    assert.equal(report.ok, true);
+    assert.equal(report.requests, 1);
+    assert.equal(report.totalBytes, body.length);
+    assert.match(report.units.throughput, /МиБ\/с/);
+  } finally {
+    await server.close();
+  }
+});
+
+test('main: ошибка HTTP в --json режиме', async () => {
+  const server = await startServer((request, response) => {
+    response.writeHead(500);
+    response.end();
+  });
+
+  try {
+    const stdout = [];
+    const stderr = [];
+    const code = await main(
+      ['--json', '--allow-private', '--requests', '1', server.url],
+      { stdout: writeTo(stdout), stderr: writeTo(stderr) },
+    );
+
+    assert.equal(code, 1);
+    const payload = JSON.parse(stdout.join(''));
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, 'HTTP_STATUS');
+  } finally {
+    await server.close();
+  }
+});
+
+test('main: ошибка аргументов даёт код 2', async () => {
+  const stdout = [];
+  const stderr = [];
+  const code = await main([], { stdout: writeTo(stdout), stderr: writeTo(stderr) });
+  assert.equal(code, 2);
+  assert.match(stderr.join(''), /URL/);
+});
+
+test('main: ошибка аргументов в --json режиме тоже JSON', async () => {
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--json', 'ftp://example.com/file'], {
+    stdout: writeTo(stdout),
+    stderr: writeTo(stderr),
+  });
+  assert.equal(code, 2);
+  assert.equal(stderr.join(''), '');
+  const payload = JSON.parse(stdout.join(''));
+  assert.equal(payload.ok, false);
+  assert.equal(payload.error.code, 'USAGE');
+});
+
+test('formatReport: содержит единицы и итоговую скорость', () => {
+  const report = {
+    target: 'https://example.com/a.png',
+    finalUrl: 'https://example.com/a.png',
+    requests: 2,
+    totalBytes: 2 * MIB,
+    totalTimeMs: 1000,
+    avgRequestMs: 500,
+    medianRequestMs: 500,
+    minRequestMs: 400,
+    maxRequestMs: 600,
+    throughput: { mibPerSecond: 2, mbitPerSecond: 16.777216 },
+    contentEncoding: null,
+    perRequest: [
+      { index: 1, bytes: MIB, durationMs: 400 },
+      { index: 2, bytes: MIB, durationMs: 600 },
+    ],
+  };
+  const text = formatReport(report);
+  assert.match(text, /МиБ\/с/);
+  assert.match(text, /Мбит\/с/);
+  assert.match(text, /Скачано всего/);
+  assert.match(text, /Среднее время/);
+});

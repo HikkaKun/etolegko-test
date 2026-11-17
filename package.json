@@ -1,0 +1,14 @@
+{
+  "name": "download-bench",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Последовательный замер скорости скачивания URL без внешних зависимостей",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "bench": "node download-bench.mjs",
+    "test": "node --test test/"
+  }
+}
