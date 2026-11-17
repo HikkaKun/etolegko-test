@@ -115,12 +115,8 @@ function round(value, digits = 3) {
 // Разбор аргументов командной строки
 // ---------------------------------------------------------------------------
 
-/**
- * @param {string[]} argv аргументы без node и имени скрипта
- * @returns {object} разобранные и проверенные опции
- */
-export function parseArgs(argv) {
-  const options = {
+function createDefaultOptions() {
+  return {
     target: null,
     requests: DEFAULTS.requests,
     timeoutMs: DEFAULTS.timeoutMs,
@@ -130,7 +126,25 @@ export function parseArgs(argv) {
     json: false,
     help: false,
   };
+}
 
+/**
+ * @param {string[]} argv аргументы без node и имени скрипта
+ * @returns {object} разобранные и проверенные опции
+ */
+export function parseArgs(argv) {
+  const options = createDefaultOptions();
+  try {
+    return parseArgsInto(argv, options);
+  } catch (error) {
+    // JSON-режим считается включённым только если валидный --json уже был
+    // разобран. Иначе ошибка вроде --json=foo не должна давать JSON.
+    if (error instanceof BenchError) error.jsonRequested = options.json === true;
+    throw error;
+  }
+}
+
+function parseArgsInto(argv, options) {
   const positionals = [];
   let endOfFlags = false;
 
@@ -1065,7 +1079,7 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     options = parseArgs(argv);
   } catch (error) {
     const message = error instanceof BenchError ? error.message : String(error);
-    const jsonRequested = argv.some((arg) => arg === '--json' || arg.startsWith('--json='));
+    const jsonRequested = error instanceof BenchError && error.jsonRequested === true;
     if (jsonRequested) {
       stdout.write(
         `${JSON.stringify(

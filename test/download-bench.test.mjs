@@ -733,6 +733,30 @@ test('main: ошибка аргументов в --json режиме тоже JS
   assert.equal(payload.error.code, 'USAGE');
 });
 
+test('main: --json=foo — ошибка, а не JSON-режим', async () => {
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--json=foo', 'http://example.com/file'], {
+    stdout: writeTo(stdout),
+    stderr: writeTo(stderr),
+  });
+  assert.equal(code, 2);
+  assert.equal(stdout.join(''), '');
+  assert.match(stderr.join(''), /не принимает значение/);
+});
+
+test('main: --json в позиции значения не включает JSON', async () => {
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--requests', '--json', 'http://example.com/file'], {
+    stdout: writeTo(stdout),
+    stderr: writeTo(stderr),
+  });
+  assert.equal(code, 2);
+  assert.equal(stdout.join(''), '');
+  assert.match(stderr.join(''), /ожидается целое число/);
+});
+
 test('formatReport: содержит единицы и итоговую скорость', () => {
   const report = {
     target: 'https://example.com/a.png',
